@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import MixtureSameFamily, Categorical, Independent
 from torch.nn.parameter import Parameter
 
 from early_classifier.sgdm.torch_ard import LinearARD
@@ -29,6 +30,7 @@ class GMML(nn.Module):
         self.g = n_component
         self.cov_type = cov_type
         self.n_total_component = n_component*n_class
+        self.batch_size = 25
         # self.ones_mask = (torch.triu(torch.ones(input_dim, input_dim)) == 1)
         # Bias term will be set in the linear layer so we omitted "+1"
         #if cov_type == "diag":
@@ -38,7 +40,7 @@ class GMML(nn.Module):
         # Parameters
         self.bottleneck = nn.Identity() #nn.Linear(self.input_dim, self.d, bias=False)
         self.mu_p = Parameter(torch.zeros(self.s, self.g, self.d), requires_grad=True)
-        self.omega_p = Parameter(torch.randn(self.s, self.g), requires_grad=True)
+        self.omega_p = Parameter(torch.ones(self.s, self.g), requires_grad=True)
         self._last_log_likelihood = None
         if True: # self.cov_type == "full":
             sigma_p = torch.eye(self.d).reshape(1, 1, self.d, self.d).repeat(self.s, self.g, 1, 1)
@@ -57,12 +59,15 @@ class GMML(nn.Module):
         '''
         # Enforced parameters
         self.distributions = {node: {0: None} for node in range(self.s)}
+        self.distribution = None
         with torch.no_grad():
             self.parameter_enforcing()
 
     def forward(self, x):
-        output = torch.zeros(x.shape[0], self.s).to(self.sigma_p.device)
         x = self.bottleneck(x)
+        x = x.reshape(x.shape[0], 1, x.shape[1]).repeat(round(self.batch_size/x.shape[0]), 1, 1)[:self.batch_size]
+        return self.distribution.log_prob(x)
+        output = torch.zeros(x.shape[0], self.s).to(self.sigma_p.device)
         for node in range(self.s):
             distribution = self.distributions[node][0]
             for i in range(x.shape[0]):
@@ -79,7 +84,7 @@ class GMML(nn.Module):
         if True: #self.cov_type == "full":
             sigma_p = self.sigma_p
             m = torch.matmul(sigma_p.transpose(-2, -1), sigma_p).to(device)
-            sigma = m + 0.01*torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True)*torch.eye(self.d).to(device)
+            sigma = m + torch.diag_embed(0.01*torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True).repeat(1, 1, self.d)).to(device)
         if self.cov_type == "diag":
             sigma[:, :, tli[0], tli[1]] = 0
             sigma[:, :, tui[0], tui[1]] = 0
@@ -101,11 +106,19 @@ class GMML(nn.Module):
         mu = self.mu_p
         # OMEGA - should sum up to 1
         omega = torch.softmax(self.omega_p, -1)
+        # v1: manual list of MultivariateNormal
         for node in range(self.s):
             if self.cov_type == "tril":
                 self.distributions[node][0] = MultivariateNormal(mu[node][0], scale_tril=sigma[node][0])
             else:
                 self.distributions[node][0] = MultivariateNormal(mu[node][0], covariance_matrix=sigma[node][0])
+        # v2: MixtureSameFamily
+        mix = Categorical(omega.flatten())
+        batch_mu = mu.expand(1, *mu.shape).repeat(self.batch_size, *torch.ones(len(mu.shape)).type(torch.int))
+        batch_sigma = sigma.expand(1, *sigma.shape).repeat(self.batch_size, *torch.ones(len(sigma.shape)).type(torch.int))
+        # comp = Independent([self.distributions[n][c] for n in self.distributions.keys() for c in self.distributions[n].keys()], 1)
+        # comp = Independent(MultivariateNormal(batch_mu.flatten(1, 2), covariance_matrix=batch_sigma.flatten(1, 2)), 32)
+        self.distribution = MultivariateNormal(batch_mu.flatten(1, 2), covariance_matrix=batch_sigma.flatten(1, 2))
 
 
 def zero_grad_hook(cov_type):
