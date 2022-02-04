@@ -1,22 +1,27 @@
-import numpy as np
+import math
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import MixtureSameFamily, Categorical, Independent
-from torch.nn.parameter import Parameter
 
-from early_classifier.sgdm.torch_ard import LinearARD
+import torch.nn as nn
+
+from torch.nn.parameter import Parameter
 from torch.distributions.multivariate_normal import MultivariateNormal
 
 
 class GMML(nn.Module):
-    def __init__(self, input_dim, d, n_class, n_component=1, cov_type="full", **kwargs):
-        """An GMM layer, which can be used as a last layer for a classification neural network.
+    def __init__(self, input_dim, d, n_class, n_component=1, cov_type="full", log_stretch_trick=False,
+                 **kwargs):
+        """A GMM layer, which can be used as a last layer for a classification neural network.
         Attributes:
             input_dim (int): Input dimension
+            d (int): Reduced number of dimensions after random projection
             n_class (int): The number of classes
-            n_component (int): The number of Gaussian components
-            cov_type: (str): The type of covariance matrices. If "diag", diagonal matrices are used, which is computationally advantageous. If "full", the model uses full rank matrices that have high expression capability at the cost of increased computational complexity.
+            n_component (int): The number of Gaussian components per class
+            cov_type: (str): The type of covariance matrices. If "diag", diagonal matrices are used, which is
+                computationally advantageous. If "full", the model uses full rank matrices that have high expression
+                capability at the cost of increased computational complexity. If "tril", use lower triangular matrices.
+            log_stretch_trick (bool): If True, computes the weighted sum over the logarithms of log probabilities, i.e.,
+            log(log(p) instead of log(p). This can help in situations where a big portion of data is classified with
+            maximum confidence (log_prob = 0, prob = 1) after the weighted sum.
         """
         super(GMML, self).__init__(**kwargs)
         assert input_dim > 0
@@ -25,111 +30,93 @@ class GMML(nn.Module):
         assert n_component > 0
         assert cov_type in ["diag", "full", "tril"]
         self.input_dim = input_dim
-        self.d = input_dim
+        self.d = d
         self.s = n_class
         self.g = n_component
         self.cov_type = cov_type
         self.n_total_component = n_component*n_class
-        self.batch_size = 25
-        # self.ones_mask = (torch.triu(torch.ones(input_dim, input_dim)) == 1)
-        # Bias term will be set in the linear layer so we omitted "+1"
-        #if cov_type == "diag":
-        #    self.H = int(2 * self.input_dim)
-        #else:
-        #    self.H = int(self.input_dim * (self.input_dim + 3) / 2)
-        # Parameters
-        self.bottleneck = nn.Identity() #nn.Linear(self.input_dim, self.d, bias=False)
-        self.mu_p = Parameter(torch.zeros(self.s, self.g, self.d), requires_grad=True)
+        self.log_stretch_trick = log_stretch_trick
+
+        # Dimensionality reduction
+        self.bottleneck = nn.Linear(self.input_dim, self.d)
+        self.bottleneck.requires_grad_(False)
+        self.bottleneck.weight.data = get_achlioptas(self.input_dim, self.d).transpose(0, 1)
+
+        # Free parameters
+        self.mu_p = Parameter(torch.randn(self.s, self.g, self.d), requires_grad=True)
         self.omega_p = Parameter(torch.ones(self.s, self.g), requires_grad=True)
-        self._last_log_likelihood = None
-        if True: # self.cov_type == "full":
-            sigma_p = torch.eye(self.d).reshape(1, 1, self.d, self.d).repeat(self.s, self.g, 1, 1)
-            self.sigma_p = Parameter(sigma_p, requires_grad=True)
-            # self.sigma_p = Parameter(torch.randn(self.s, self.g, self.d, self.d), requires_grad=True)
-            # self.sigma_p.register_hook(zero_grad_hook(self.cov_type))
-        '''
-        elif self.cov_type == "diag":
-            self.sigma_p = Parameter(torch.ones(self.s, self.g, self.d), requires_grad=True)
-        elif self.cov_type == "tril":
-            self.sigma_p_l = Parameter(torch.zeros(self.s, self.g, round(self.d*(self.d - 1)/2)), requires_grad=True)
-            self.sigma_p_d = Parameter(torch.ones(self.s, self.g, self.d), requires_grad=True)
-            # with torch.no_grad():
-            #     # self.sigma_p[:, :, torch.arange(self.d)] = 1
-            #     self.sigma_p[:, :, [round(2*n + n*(n-1)/2) for n in range(self.d)]] = 1
-        '''
-        # Enforced parameters
-        self.distributions = {node: {0: None} for node in range(self.s)}
+        sigma_data = torch.eye(self.d).reshape(1, 1, self.d, self.d).repeat(self.s, self.g, 1, 1)
+        self.sigma_p = Parameter(sigma_data, requires_grad=True)
+
+        # Sampled parameters
+        self.omega = None
         self.distribution = None
         with torch.no_grad():
             self.parameter_enforcing()
 
+    def init_mu(self, mu):
+        with torch.no_grad():
+            self.mu_p.data = mu
+
+    def init_omega(self, omega):
+        with torch.no_grad():
+            self.omega_p.data = omega
+
     def forward(self, x):
+        b = x.shape[0]
         x = self.bottleneck(x)
-        x = x.reshape(x.shape[0], 1, x.shape[1]).repeat(round(self.batch_size/x.shape[0]), 1, 1)[:self.batch_size]
-        return self.distribution.log_prob(x)
-        output = torch.zeros(x.shape[0], self.s).to(self.sigma_p.device)
-        for node in range(self.s):
-            distribution = self.distributions[node][0]
-            for i in range(x.shape[0]):
-                output[i][node] = distribution.log_prob(x[i])
-        return output
+        x = x.reshape(b, 1, x.shape[1])
+        log_wp = self.distribution.log_prob(x) + self.omega.reshape(self.s*self.g).log()
+        if self.log_stretch_trick:
+            log_wp = -torch.log(-log_wp)
+        log_mixture_p = log_wp - log_wp.logsumexp(dim=-1, keepdim=True)
+        return log_mixture_p.reshape(b, self.s, self.g).logsumexp(dim=-1)
 
     def parameter_enforcing(self):
+        # OMEGA - should sum up to 1
+        # omega = torch.softmax(self.omega_p, -1) / self.omega_p.shape[-2]
+        omega = self.omega_p.data.clone()
+        omega -= omega.min()
+        omega = omega / omega.sum(dim=-1, keepdim=True)
+        omega /= omega.shape[-2]
+        self.omega = omega
         # SIGMA - symmetric positive definite
-        # with torch.no_grad():
-        #     self.sigma_p[self.sigma_p < 2e-04] = 0
         device = self.sigma_p.device
         tli = torch.tril_indices(row=self.sigma_p.size(-2), col=self.sigma_p.size(-1), offset=-1).to(device)
         tui = torch.triu_indices(row=self.sigma_p.size(-2), col=self.sigma_p.size(-1), offset=1).to(device)
-        if True: #self.cov_type == "full":
-            sigma_p = self.sigma_p
-            m = torch.matmul(sigma_p.transpose(-2, -1), sigma_p).to(device)
-            sigma = m + torch.diag_embed(0.01*torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True).repeat(1, 1, self.d)).to(device)
+        sigma_p = self.sigma_p
+        m = torch.matmul(sigma_p.transpose(-2, -1), sigma_p).to(device)
+        sigma = m + torch.diag_embed(0.01*torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True)
+                                     .repeat(1, 1, self.d)).to(device)
         if self.cov_type == "diag":
             sigma[:, :, tli[0], tli[1]] = 0
             sigma[:, :, tui[0], tui[1]] = 0
         elif self.cov_type == "tril":
             sigma[:, :, tui[0], tui[1]] = 0
-        '''
-        if self.cov_type == "diag":
-            sigma_p = torch.diag_embed(self.sigma_p)
-            m = torch.matmul(sigma_p.transpose(-2, -1), sigma_p)
-            self.sigma = m + 0.01 * torch.diag_embed(torch.linalg.eig(m).eigenvalues.real)
-        elif self.cov_type == "tril":
-            d = self.sigma_p_d * self.sigma_p_d
-            d += torch.mean(d) * 0.01
-            self.sigma = torch.diag_embed(d)
-            ti = torch.tril_indices(row=self.d, col=self.d, offset=-1)
-            self.sigma[:, :, ti[0], ti[1]] = self.sigma_p_l
-        '''
         # MU - no transformation
         mu = self.mu_p
-        # OMEGA - should sum up to 1
-        omega = torch.softmax(self.omega_p, -1)
-        # v1: manual list of MultivariateNormal
-        for node in range(self.s):
-            if self.cov_type == "tril":
-                self.distributions[node][0] = MultivariateNormal(mu[node][0], scale_tril=sigma[node][0])
-            else:
-                self.distributions[node][0] = MultivariateNormal(mu[node][0], covariance_matrix=sigma[node][0])
-        # v2: MixtureSameFamily
-        mix = Categorical(omega.flatten())
-        batch_mu = mu.expand(1, *mu.shape).repeat(self.batch_size, *torch.ones(len(mu.shape)).type(torch.int))
-        batch_sigma = sigma.expand(1, *sigma.shape).repeat(self.batch_size, *torch.ones(len(sigma.shape)).type(torch.int))
-        # comp = Independent([self.distributions[n][c] for n in self.distributions.keys() for c in self.distributions[n].keys()], 1)
-        # comp = Independent(MultivariateNormal(batch_mu.flatten(1, 2), covariance_matrix=batch_sigma.flatten(1, 2)), 32)
-        self.distribution = MultivariateNormal(batch_mu.flatten(1, 2), covariance_matrix=batch_sigma.flatten(1, 2))
+        # Initialize normal distribution using sampled MU and SIGMA
+        if self.cov_type == "full":
+            self.distribution = MultivariateNormal(mu.flatten(0, 1), covariance_matrix=sigma.flatten(0, 1))
+        else:
+            self.distribution = MultivariateNormal(mu.flatten(0, 1), scale_tril=sigma.flatten(0, 1))
 
 
-def zero_grad_hook(cov_type):
-    def hook(grad):
-        grad = grad.clone() # NEVER change the given grad inplace
-        tli = torch.tril_indices(row=grad.size(-2), col=grad.size(-1), offset=-1)
-        tui = torch.triu_indices(row=grad.size(-2), col=grad.size(-1), offset=1)
-        if cov_type == "diag":
-            grad[:, :, tli[0], tli[1]] = 0
-            grad[:, :, tui[0], tui[1]] = 0
-        elif cov_type == "tril":
-            grad[:, :, tui[0], tui[1]] = 0
-        return grad
-    return hook
+def get_achlioptas(n, m, s=3):
+    """
+    Random Projection algorithm for Dimensionality Reduction from Achlioptas 2001 (Microsoft)
+    https://dl.acm.org/doi/pdf/10.1145/375551.375608
+    Args:
+        n: input data dimension
+        m: output desired dimension
+        s: 1 / density. Should be greater or equal than 1 (density range is (0, 1]).
+
+    Returns: n*m matrix that can be used for random-projection dimensionality reduction.
+
+    """
+    t = torch.rand(n, m)
+    t = t.masked_fill(t.greater(1 - 1 / (2 * s)), -1)
+    t = t.masked_fill(t.greater(1 / (2 * s)), 0)
+    t = t.masked_fill(t.greater(0), 1)
+    t = t*math.sqrt(s)/math.sqrt(m)
+    return t
