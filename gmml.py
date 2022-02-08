@@ -8,8 +8,7 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 
 
 class GMML(nn.Module):
-    def __init__(self, input_dim, d, n_class, n_component=1, cov_type="full", log_stretch_trick=False,
-                 **kwargs):
+    def __init__(self, input_dim, d, n_class, n_component=1, cov_type="diag", log_stretch_trick=False, **kwargs):
         """A GMM layer, which can be used as a last layer for a classification neural network.
         Attributes:
             input_dim (int): Input dimension
@@ -29,13 +28,16 @@ class GMML(nn.Module):
         assert n_class > 1
         assert n_component > 0
         assert cov_type in ["diag", "full", "tril"]
+
         self.input_dim = input_dim
         self.d = d
         self.s = n_class
         self.g = n_component
         self.cov_type = cov_type
-        self.n_total_component = n_component*n_class
+        self.n_total_component = n_component * n_class
         self.log_stretch_trick = log_stretch_trick
+
+        self.relu = torch.nn.ReLU()
 
         # Dimensionality reduction
         self.bottleneck = nn.Linear(self.input_dim, self.d)
@@ -52,7 +54,7 @@ class GMML(nn.Module):
         self.omega = None
         self.distribution = None
         with torch.no_grad():
-            self.parameter_enforcing()
+            self.sample_parameters()
 
     def init_mu(self, mu):
         with torch.no_grad():
@@ -66,17 +68,18 @@ class GMML(nn.Module):
         b = x.shape[0]
         x = self.bottleneck(x)
         x = x.reshape(b, 1, x.shape[1])
-        log_wp = self.distribution.log_prob(x) + self.omega.reshape(self.s*self.g).log()
+        log_wp = self.distribution.log_prob(x) + self.omega.reshape(self.s * self.g).log()
+        log_wp = - self.relu(-log_wp)
         if self.log_stretch_trick:
-            log_wp = -torch.log(-log_wp)
+            log_wp = -torch.log(-log_wp + 0.0001)
         log_mixture_p = log_wp - log_wp.logsumexp(dim=-1, keepdim=True)
         return log_mixture_p.reshape(b, self.s, self.g).logsumexp(dim=-1)
 
-    def parameter_enforcing(self):
+    def sample_parameters(self):
         # OMEGA - should sum up to 1
         # omega = torch.softmax(self.omega_p, -1) / self.omega_p.shape[-2]
         omega = self.omega_p.data.clone()
-        omega -= omega.min()
+        omega -= min(0, omega.min().item())
         omega = omega / omega.sum(dim=-1, keepdim=True)
         omega /= omega.shape[-2]
         self.omega = omega
@@ -86,7 +89,7 @@ class GMML(nn.Module):
         tui = torch.triu_indices(row=self.sigma_p.size(-2), col=self.sigma_p.size(-1), offset=1).to(device)
         sigma_p = self.sigma_p
         m = torch.matmul(sigma_p.transpose(-2, -1), sigma_p).to(device)
-        sigma = m + torch.diag_embed(0.01*torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True)
+        sigma = m + torch.diag_embed(0.01 * torch.mean(torch.linalg.eig(m).eigenvalues.real, dim=-1, keepdim=True)
                                      .repeat(1, 1, self.d)).to(device)
         if self.cov_type == "diag":
             sigma[:, :, tli[0], tli[1]] = 0
@@ -118,5 +121,5 @@ def get_achlioptas(n, m, s=3):
     t = t.masked_fill(t.greater(1 - 1 / (2 * s)), -1)
     t = t.masked_fill(t.greater(1 / (2 * s)), 0)
     t = t.masked_fill(t.greater(0), 1)
-    t = t*math.sqrt(s)/math.sqrt(m)
+    t = t * math.sqrt(s) / math.sqrt(m)
     return t
