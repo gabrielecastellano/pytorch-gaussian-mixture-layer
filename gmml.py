@@ -40,7 +40,7 @@ class GMML(nn.Module):
         self.relu = torch.nn.ReLU()
 
         # Dimensionality reduction
-        self.bottleneck = nn.Linear(self.input_dim, self.d)
+        self.bottleneck = nn.Linear(self.input_dim, self.d, bias=False)
         self.bottleneck.requires_grad_(False)
         self.bottleneck.weight.data = get_achlioptas(self.input_dim, self.d).transpose(0, 1)
 
